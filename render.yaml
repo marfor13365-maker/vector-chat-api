@@ -1,1 +1,9 @@
-
+services:
+  - type: web
+    name: vector-chat-api
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: DATABASE_URL
+        value: postgresql://vector_chat_db_user:J4CFT3qFGwjl3OC5bq8eaMp5Tw7apGAl@dpg-d8kgeij7uimc73b1dr50-a/vector_chat_db
