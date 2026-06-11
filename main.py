@@ -5,6 +5,7 @@ import psycopg2
 import os
 import uuid
 import base64
+import httpx
 
 app = FastAPI()
 
@@ -16,6 +17,7 @@ app.add_middleware(
 )
 
 DB = os.environ.get("DATABASE_URL")
+GROQ_KEY = os.environ.get("GROQ_KEY")
 
 def get_conn():
     return psycopg2.connect(DB)
@@ -50,9 +52,29 @@ class Message(BaseModel):
     role: str
     content: str = ""
 
+class ChatRequest(BaseModel):
+    messages: list
+
 @app.get("/")
 def root():
     return {"status": "ok"}
+
+@app.post("/chat")
+async def chat(req: ChatRequest):
+    async with httpx.AsyncClient() as client:
+        r = await client.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {GROQ_KEY}",
+                "Content-Type": "application/json"
+            },
+            json={
+                "model": "llama3-70b-8192",
+                "messages": req.messages
+            },
+            timeout=30.0
+        )
+        return r.json()
 
 @app.post("/chats")
 def create_chat():
@@ -84,7 +106,7 @@ def get_messages(chat_id: str):
     conn = get_conn()
     cur = conn.cursor()
     cur.execute(
-        "SELECT id, role, content, file_url, created_at FROM messages WHERE chat_id=%s ORDER BY created_at",
+        "SELECT id, role, content, file_url FROM messages WHERE chat_id=%s ORDER BY created_at",
         (chat_id,)
     )
     rows = cur.fetchall()
