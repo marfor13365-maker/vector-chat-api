@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI, UploadFile, File, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import psycopg2
@@ -18,6 +18,7 @@ app.add_middleware(
 
 DB = os.environ.get("DATABASE_URL")
 GROQ_KEY = os.environ.get("GROQ_KEY")
+ADMIN_PASSWORD = "Papuas13"
 
 def get_conn():
     return psycopg2.connect(DB)
@@ -115,7 +116,9 @@ def get_messages(chat_id: str):
     return [{"id": r[0], "role": r[1], "content": r[2], "file_url": r[3]} for r in rows]
 
 @app.get("/admin/chats")
-def get_all_chats():
+def get_all_chats(password: str = Query(...)):
+    if password != ADMIN_PASSWORD:
+        raise HTTPException(status_code=403, detail="Неверный пароль")
     conn = get_conn()
     cur = conn.cursor()
     cur.execute("""
@@ -127,6 +130,21 @@ def get_all_chats():
     cur.close()
     conn.close()
     return [{"id": r[0], "created_at": str(r[1]), "last_msg": r[2]} for r in rows]
+
+@app.get("/admin/messages/{chat_id}")
+def get_chat_messages(chat_id: str, password: str = Query(...)):
+    if password != ADMIN_PASSWORD:
+        raise HTTPException(status_code=403, detail="Неверный пароль")
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT role, content, created_at FROM messages WHERE chat_id=%s ORDER BY created_at",
+        (chat_id,)
+    )
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    return [{"role": r[0], "content": r[1], "time": str(r[2])} for r in rows]
 
 @app.post("/upload/{chat_id}")
 async def upload_file(chat_id: str, file: UploadFile = File(...)):
