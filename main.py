@@ -18,6 +18,8 @@ app.add_middleware(
 
 DB = os.environ.get("DATABASE_URL")
 GROQ_KEY = os.environ.get("GROQ_KEY")
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 
 def get_conn():
     return psycopg2.connect(DB)
@@ -194,6 +196,16 @@ def blizko_login(req: AdminLogin):
     if req.password != admin_pass:
         raise HTTPException(status_code=403, detail="Wrong password")
     return {"ok": True}
+
+@app.get("/blizko/config")
+def blizko_config(password: str = Query(...)):
+    admin_pass = os.environ.get("BLIZKO_ADMIN_PASS", "admin2024")
+    if password != admin_pass:
+        raise HTTPException(status_code=403, detail="Wrong password")
+    return {
+        "supabase_url": SUPABASE_URL or "",
+        "supabase_key": SUPABASE_KEY or ""
+    }
 
 @app.post("/blizko/groq")
 async def blizko_groq(req: GroqRequest):
