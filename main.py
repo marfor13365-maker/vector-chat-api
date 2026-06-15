@@ -18,7 +18,6 @@ app.add_middleware(
 
 DB = os.environ.get("DATABASE_URL")
 GROQ_KEY = os.environ.get("GROQ_KEY")
-ADMIN_PASSWORD = "Papuas13"
 
 def get_conn():
     return psycopg2.connect(DB)
@@ -55,6 +54,14 @@ class Message(BaseModel):
 
 class ChatRequest(BaseModel):
     messages: list
+
+class AdminLogin(BaseModel):
+    password: str
+
+class GroqRequest(BaseModel):
+    password: str
+    messages: list
+    persona: str = ""
 
 @app.get("/")
 def root():
@@ -117,8 +124,9 @@ def get_messages(chat_id: str):
 
 @app.get("/admin/chats")
 def get_all_chats(password: str = Query(...)):
-    if password != ADMIN_PASSWORD:
-        raise HTTPException(status_code=403, detail="Неверный пароль")
+    admin_pass = os.environ.get("ADMIN_PASSWORD", "Papuas13")
+    if password != admin_pass:
+        raise HTTPException(status_code=403, detail="Wrong password")
     conn = get_conn()
     cur = conn.cursor()
     cur.execute("""
@@ -133,8 +141,9 @@ def get_all_chats(password: str = Query(...)):
 
 @app.get("/admin/messages/{chat_id}")
 def get_chat_messages(chat_id: str, password: str = Query(...)):
-    if password != ADMIN_PASSWORD:
-        raise HTTPException(status_code=403, detail="Неверный пароль")
+    admin_pass = os.environ.get("ADMIN_PASSWORD", "Papuas13")
+    if password != admin_pass:
+        raise HTTPException(status_code=403, detail="Wrong password")
     conn = get_conn()
     cur = conn.cursor()
     cur.execute(
@@ -148,8 +157,9 @@ def get_chat_messages(chat_id: str, password: str = Query(...)):
 
 @app.delete("/admin/chat/{chat_id}")
 def delete_chat(chat_id: str, password: str = Query(...)):
-    if password != ADMIN_PASSWORD:
-        raise HTTPException(status_code=403, detail="Неверный пароль")
+    admin_pass = os.environ.get("ADMIN_PASSWORD", "Papuas13")
+    if password != admin_pass:
+        raise HTTPException(status_code=403, detail="Wrong password")
     conn = get_conn()
     cur = conn.cursor()
     cur.execute("DELETE FROM messages WHERE chat_id=%s", (chat_id,))
@@ -175,3 +185,37 @@ async def upload_file(chat_id: str, file: UploadFile = File(...)):
     cur.close()
     conn.close()
     return {"id": msg_id, "file_url": file_url}
+
+# ── Blizko Admin endpoints ──
+
+@app.post("/blizko/login")
+def blizko_login(req: AdminLogin):
+    admin_pass = os.environ.get("BLIZKO_ADMIN_PASS", "admin2024")
+    if req.password != admin_pass:
+        raise HTTPException(status_code=403, detail="Wrong password")
+    return {"ok": True}
+
+@app.post("/blizko/groq")
+async def blizko_groq(req: GroqRequest):
+    admin_pass = os.environ.get("BLIZKO_ADMIN_PASS", "admin2024")
+    if req.password != admin_pass:
+        raise HTTPException(status_code=403, detail="Wrong password")
+    msgs = []
+    if req.persona:
+        msgs.append({"role": "system", "content": req.persona})
+    msgs.extend(req.messages)
+    async with httpx.AsyncClient() as client:
+        r = await client.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {GROQ_KEY}",
+                "Content-Type": "application/json"
+            },
+            json={
+                "model": "llama-3.1-8b-instant",
+                "messages": msgs,
+                "max_tokens": 200
+            },
+            timeout=30.0
+        )
+        return r.json()
