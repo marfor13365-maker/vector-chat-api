@@ -1,11 +1,14 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException, Query
+from fastapi import FastAPI, UploadFile, File, HTTPException, Query, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from typing import Optional
 import psycopg2
 import os
 import uuid
 import base64
 import httpx
+
+from push_utils import send_push_to_user
 
 app = FastAPI()
 
@@ -20,6 +23,7 @@ DB = os.environ.get("DATABASE_URL")
 GROQ_KEY = os.environ.get("GROQ_KEY")
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
+INTERNAL_API_KEY = os.environ.get("INTERNAL_API_KEY", "")
 
 def get_conn():
     return psycopg2.connect(DB)
@@ -64,6 +68,15 @@ class GroqRequest(BaseModel):
     password: str
     messages: list
     persona: str = ""
+
+class SendPushRequest(BaseModel):
+    to_user_id: str
+    title: str
+    body: str
+    type: str = "message"      # "message" или "call"
+    callId: Optional[str] = None
+    fromUserId: Optional[str] = None
+    url: Optional[str] = None
 
 @app.get("/")
 def root():
@@ -231,3 +244,22 @@ async def blizko_groq(req: GroqRequest):
             timeout=30.0
         )
         return r.json()
+
+# ── Push-уведомления (звонки / сообщения в Blizko) ──
+
+@app.post("/api/send-push")
+async def api_send_push(req: SendPushRequest, x_api_key: str = Header(None)):
+    if not INTERNAL_API_KEY or x_api_key != INTERNAL_API_KEY:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    payload = {
+        "title": req.title,
+        "body": req.body,
+        "type": req.type,
+        "callId": req.callId,
+        "fromUserId": req.fromUserId,
+        "url": req.url or "/"
+    }
+
+    result = await send_push_to_user(req.to_user_id, payload)
+    return result
