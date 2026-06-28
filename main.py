@@ -9,6 +9,14 @@ import base64
 import httpx
 
 from push_utils import send_push_to_user
+from unlock_utils import (
+    create_unlock_request,
+    get_unlock_request,
+    mark_request_paid,
+    redeem_code,
+    consume_extra_account_request,
+    find_user_id_by_email,
+)
 
 app = FastAPI()
 
@@ -77,6 +85,23 @@ class SendPushRequest(BaseModel):
     callId: Optional[str] = None
     fromUserId: Optional[str] = None
     url: Optional[str] = None
+
+class CreateUnlockRequest(BaseModel):
+    type: str  # "unlock" или "extra_account"
+    device_id: str
+    email: Optional[str] = None  # обязательно для type="unlock"
+
+class MarkPaidRequest(BaseModel):
+    request_id: str
+
+class RedeemCodeRequest(BaseModel):
+    code: str
+    device_id: str
+
+class ConsumeExtraRequest(BaseModel):
+    code: str
+    device_id: str
+    new_user_id: str
 
 @app.get("/")
 def root():
@@ -263,3 +288,75 @@ async def api_send_push(req: SendPushRequest, x_api_key: str = Header(None)):
 
     result = await send_push_to_user(req.to_user_id, payload)
     return result
+
+# ── Разблокировка аккаунта / доп. аккаунт через промокод из Telegram-бота ──
+
+@app.post("/api/unlock/create-request")
+async def api_create_unlock_request(req: CreateUnlockRequest):
+    target_user_id = None
+    if req.type == "unlock":
+        if not req.email:
+            raise HTTPException(status_code=400, detail="email required for unlock")
+        target_user_id = await find_user_id_by_email(req.email)
+        if not target_user_id:
+            raise HTTPException(status_code=404, detail="user_not_found")
+    elif req.type != "extra_account":
+        raise HTTPException(status_code=400, detail="invalid type")
+
+    request_id, deep_link, price = await create_unlock_request(req.type, req.device_id, target_user_id)
+    return {"request_id": request_id, "telegram_link": deep_link, "price": price}
+
+
+@app.get("/api/unlock/request/{request_id}")
+async def api_unlock_request_info(request_id: str):
+    """Публичная (безопасная) информация о заявке — для бота, чтобы узнать тип/цену.
+    Не отдаёт email/target_user_id."""
+    req = await get_unlock_request(request_id)
+    if not req:
+        raise HTTPException(status_code=404, detail="not_found")
+    return {
+        "type": req["type"],
+        "price": req["price"],
+        "status": req["status"]
+    }
+
+
+@app.get("/api/unlock/status/{request_id}")
+async def api_unlock_status(request_id: str):
+    req = await get_unlock_request(request_id)
+    if not req:
+        raise HTTPException(status_code=404, detail="not_found")
+    return {
+        "status": req["status"],
+        "type": req["type"],
+        "price": req["price"],
+        "code": req["code"] if req["status"] in ("paid", "used") else None
+    }
+
+
+@app.post("/api/unlock/mark-paid")
+async def api_mark_paid(req: MarkPaidRequest, x_api_key: str = Header(None)):
+    # Вызывается ТОЛЬКО ботом после успешной оплаты
+    if not INTERNAL_API_KEY or x_api_key != INTERNAL_API_KEY:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    code, error = await mark_request_paid(req.request_id)
+    if error:
+        raise HTTPException(status_code=400, detail=error)
+    return {"code": code}
+
+
+@app.post("/api/unlock/redeem")
+async def api_redeem_code(req: RedeemCodeRequest):
+    result = await redeem_code(req.code, req.device_id)
+    if not result.get("ok"):
+        raise HTTPException(status_code=400, detail=result.get("error", "unknown_error"))
+    return result
+
+
+@app.post("/api/unlock/consume-extra")
+async def api_consume_extra(req: ConsumeExtraRequest):
+    ok = await consume_extra_account_request(req.code, req.device_id, req.new_user_id)
+    if not ok:
+        raise HTTPException(status_code=400, detail="invalid_or_used_code")
+    return {"ok": True}
