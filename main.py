@@ -17,6 +17,8 @@ from unlock_utils import (
     consume_extra_account_request,
     link_device_account,
     list_device_accounts,
+    get_user_id_from_token,
+    delete_auth_user,
 )
 
 app = FastAPI()
@@ -107,6 +109,10 @@ class LinkDeviceRequest(BaseModel):
     device_id: str
     user_id: str
     email: str
+
+class DeleteAccountRequest(BaseModel):
+    user_id: str
+    access_token: str
 
 @app.get("/")
 def root():
@@ -271,10 +277,11 @@ async def api_send_push(req: SendPushRequest, x_api_key: str = Header(None)):
 # ── Привязка аккаунта к устройству (сайт вызывает сразу после регистрации) ──
 
 @app.post("/api/device/link-account")
-async def api_link_device_account(req: LinkDeviceRequest):
-    ok = await link_device_account(req.device_id, req.user_id, req.email)
+async def api_link_device_account(req: LinkDeviceRequest, request: Request):
+    client_ip = request.client.host if request.client else None
+    ok, error = await link_device_account(req.device_id, req.user_id, req.email, client_ip)
     if not ok:
-        raise HTTPException(status_code=400, detail="link_failed")
+        raise HTTPException(status_code=400, detail=error or "link_failed")
     return {"ok": True}
 
 @app.get("/api/device/accounts/{device_id}")
@@ -282,6 +289,20 @@ async def api_device_accounts(device_id: str):
     """Список email всех аккаунтов на этом устройстве — сайт показывает при входе."""
     emails = await list_device_accounts(device_id)
     return {"emails": emails}
+
+@app.post("/api/account/delete")
+async def api_delete_account(req: DeleteAccountRequest):
+    """По-настоящему удаляет аккаунт из auth.users (обычный клиентский ключ так не умеет).
+    Сначала проверяем, что access_token реально принадлежит этому user_id — иначе
+    кто угодно мог бы удалить чужой аккаунт, просто зная его id."""
+    verified_id = await get_user_id_from_token(req.access_token)
+    if not verified_id or verified_id != req.user_id:
+        raise HTTPException(status_code=403, detail="token_mismatch")
+
+    ok = await delete_auth_user(req.user_id)
+    if not ok:
+        raise HTTPException(status_code=400, detail="delete_failed")
+    return {"ok": True}
 
 # ── Доп.аккаунт через код из резюме-бота (оплата за "забыл пароль" убрана полностью) ──
 
