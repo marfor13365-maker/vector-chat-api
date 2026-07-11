@@ -10,12 +10,13 @@ import httpx
 
 from push_utils import send_push_to_user
 from unlock_utils import (
-    create_unlock_request,
+    create_extra_account_request,
     get_unlock_request,
     mark_request_paid,
     redeem_code,
     consume_extra_account_request,
     link_device_account,
+    list_device_accounts,
 )
 
 app = FastAPI()
@@ -81,15 +82,13 @@ class SendPushRequest(BaseModel):
     to_user_id: str
     title: str
     body: str
-    type: str = "message"      # "message" или "call"
+    type: str = "message"
     callId: Optional[str] = None
     fromUserId: Optional[str] = None
     url: Optional[str] = None
 
-class CreateUnlockRequest(BaseModel):
-    type: str  # "unlock" или "extra_account"
+class CreateExtraAccountRequest(BaseModel):
     device_id: str
-    # email больше не нужен — для unlock аккаунт ищем по device_id
 
 class MarkPaidRequest(BaseModel):
     request_id: str
@@ -102,10 +101,12 @@ class ConsumeExtraRequest(BaseModel):
     code: str
     device_id: str
     new_user_id: str
+    email: str
 
 class LinkDeviceRequest(BaseModel):
     device_id: str
     user_id: str
+    email: str
 
 @app.get("/")
 def root():
@@ -116,14 +117,8 @@ async def chat(req: ChatRequest):
     async with httpx.AsyncClient() as client:
         r = await client.post(
             "https://api.groq.com/openai/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {GROQ_KEY}",
-                "Content-Type": "application/json"
-            },
-            json={
-                "model": "llama-3.1-8b-instant",
-                "messages": req.messages
-            },
+            headers={"Authorization": f"Bearer {GROQ_KEY}", "Content-Type": "application/json"},
+            json={"model": "llama-3.1-8b-instant", "messages": req.messages},
             timeout=30.0
         )
         return r.json()
@@ -230,8 +225,6 @@ async def upload_file(chat_id: str, file: UploadFile = File(...)):
     conn.close()
     return {"id": msg_id, "file_url": file_url}
 
-# ── Blizko Admin endpoints ──
-
 @app.post("/blizko/login")
 def blizko_login(req: AdminLogin):
     admin_pass = os.environ.get("BLIZKO_ADMIN_PASS", "admin2024")
@@ -244,10 +237,7 @@ def blizko_config(password: str = Query(...)):
     admin_pass = os.environ.get("BLIZKO_ADMIN_PASS", "admin2024")
     if password != admin_pass:
         raise HTTPException(status_code=403, detail="Wrong password")
-    return {
-        "supabase_url": SUPABASE_URL or "",
-        "supabase_key": SUPABASE_KEY or ""
-    }
+    return {"supabase_url": SUPABASE_URL or "", "supabase_key": SUPABASE_KEY or ""}
 
 @app.post("/blizko/groq")
 async def blizko_groq(req: GroqRequest):
@@ -261,75 +251,44 @@ async def blizko_groq(req: GroqRequest):
     async with httpx.AsyncClient() as client:
         r = await client.post(
             "https://api.groq.com/openai/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {GROQ_KEY}",
-                "Content-Type": "application/json"
-            },
-            json={
-                "model": "llama-3.1-8b-instant",
-                "messages": msgs,
-                "max_tokens": 200
-            },
+            headers={"Authorization": f"Bearer {GROQ_KEY}", "Content-Type": "application/json"},
+            json={"model": "llama-3.1-8b-instant", "messages": msgs, "max_tokens": 200},
             timeout=30.0
         )
         return r.json()
-
-# ── Push-уведомления (звонки / сообщения в Blizko) ──
 
 @app.post("/api/send-push")
 async def api_send_push(req: SendPushRequest, x_api_key: str = Header(None)):
     if not INTERNAL_API_KEY or x_api_key != INTERNAL_API_KEY:
         raise HTTPException(status_code=401, detail="Unauthorized")
-
     payload = {
-        "title": req.title,
-        "body": req.body,
-        "type": req.type,
-        "callId": req.callId,
-        "fromUserId": req.fromUserId,
-        "url": req.url or "/"
+        "title": req.title, "body": req.body, "type": req.type,
+        "callId": req.callId, "fromUserId": req.fromUserId, "url": req.url or "/"
     }
-
     result = await send_push_to_user(req.to_user_id, payload)
     return result
 
-# ── Привязка аккаунта к устройству (вызывается сайтом сразу после регистрации) ──
+# ── Привязка аккаунта к устройству (сайт вызывает сразу после регистрации) ──
 
 @app.post("/api/device/link-account")
 async def api_link_device_account(req: LinkDeviceRequest):
-    ok = await link_device_account(req.device_id, req.user_id)
+    ok = await link_device_account(req.device_id, req.user_id, req.email)
     if not ok:
         raise HTTPException(status_code=400, detail="link_failed")
     return {"ok": True}
 
-# ── Разблокировка аккаунта / доп. аккаунт через промокод из Telegram-бота ──
+@app.get("/api/device/accounts/{device_id}")
+async def api_device_accounts(device_id: str):
+    """Список email всех аккаунтов на этом устройстве — сайт показывает при входе."""
+    emails = await list_device_accounts(device_id)
+    return {"emails": emails}
+
+# ── Доп.аккаунт через код из резюме-бота (оплата за "забыл пароль" убрана полностью) ──
 
 @app.post("/api/unlock/create-request")
-async def api_create_unlock_request(req: CreateUnlockRequest):
-    if req.type not in ("unlock", "extra_account"):
-        raise HTTPException(status_code=400, detail="invalid type")
-
-    try:
-        request_id, deep_link, price = await create_unlock_request(req.type, req.device_id)
-    except ValueError as e:
-        # "no_account_for_device" — на этом устройстве ещё не было зарегистрировано ни одного аккаунта
-        raise HTTPException(status_code=404, detail=str(e))
-
-    return {"request_id": request_id, "telegram_link": deep_link, "price": price}
-
-
-@app.get("/api/unlock/request/{request_id}")
-async def api_unlock_request_info(request_id: str):
-    """Публичная (безопасная) информация о заявке — для бота, чтобы узнать тип/цену.
-    Не отдаёт target_user_id."""
-    req = await get_unlock_request(request_id)
-    if not req:
-        raise HTTPException(status_code=404, detail="not_found")
-    return {
-        "type": req["type"],
-        "price": req["price"],
-        "status": req["status"]
-    }
+async def api_create_extra_request(req: CreateExtraAccountRequest):
+    request_id, link, price = await create_extra_account_request(req.device_id)
+    return {"request_id": request_id, "telegram_link": link, "price": price}
 
 
 @app.get("/api/unlock/status/{request_id}")
@@ -347,10 +306,8 @@ async def api_unlock_status(request_id: str):
 
 @app.post("/api/unlock/mark-paid")
 async def api_mark_paid(req: MarkPaidRequest, x_api_key: str = Header(None)):
-    # Вызывается ТОЛЬКО ботом после успешной оплаты
     if not INTERNAL_API_KEY or x_api_key != INTERNAL_API_KEY:
         raise HTTPException(status_code=401, detail="Unauthorized")
-
     code, error = await mark_request_paid(req.request_id)
     if error:
         raise HTTPException(status_code=400, detail=error)
@@ -367,7 +324,7 @@ async def api_redeem_code(req: RedeemCodeRequest):
 
 @app.post("/api/unlock/consume-extra")
 async def api_consume_extra(req: ConsumeExtraRequest):
-    ok = await consume_extra_account_request(req.code, req.device_id, req.new_user_id)
+    ok = await consume_extra_account_request(req.code, req.device_id, req.new_user_id, req.email)
     if not ok:
         raise HTTPException(status_code=400, detail="invalid_or_used_code")
     return {"ok": True}
