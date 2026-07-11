@@ -225,7 +225,7 @@ async def get_user_id_from_token(access_token: str):
     url = SUPABASE_URL + "/auth/v1/user"
     headers = {
         "Authorization": "Bearer " + access_token,
-        "apikey": SUPABASE_ANON_KEY,
+        "apikey": SUPABASE_SERVICE_KEY,
     }
     async with httpx.AsyncClient() as client:
         r = await client.get(url, headers=headers)
@@ -242,3 +242,4 @@ async def delete_auth_user(user_id: str):
     async with httpx.AsyncClient() as client:
         r = await client.delete(url, headers=_headers())
         return r.status_code in (200, 204)
+
