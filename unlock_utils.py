@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
 SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
+SUPABASE_ANON_KEY = os.environ.get("SUPABASE_KEY", "")
 RESUME_BOT_URL = os.environ.get("RESUME_BOT_URL", "").rstrip("/")
 
 DEFAULT_PRICE_EXTRA_BASE = 200
@@ -43,8 +44,13 @@ async def get_extra_base_price():
     return DEFAULT_PRICE_EXTRA_BASE
 
 
-async def count_device_accounts(device_id: str):
-    url = SUPABASE_URL + "/rest/v1/device_accounts?device_id=eq." + device_id + "&select=id"
+async def count_device_accounts(device_id: str, ip_address: str = None):
+    """Считаем аккаунты, привязанные либо к этому device_id, либо к этому же IP —
+    так очистка localStorage (смена device_id) сама по себе не сбрасывает прогрессию цены."""
+    url = SUPABASE_URL + "/rest/v1/device_accounts?or=(device_id.eq." + device_id
+    if ip_address:
+        url += ",ip_address.eq." + ip_address
+    url += ")&select=id"
     async with httpx.AsyncClient() as client:
         r = await client.get(url, headers=_headers())
         if r.status_code != 200:
@@ -63,14 +69,20 @@ async def list_device_accounts(device_id: str):
         return [row["email"] for row in r.json() if row.get("email")]
 
 
-async def link_device_account(device_id: str, user_id: str, email: str):
-    """Вызывается сайтом сразу после регистрации — привязывает аккаунт к устройству."""
+async def link_device_account(device_id: str, user_id: str, email: str, ip_address: str = None):
+    """Вызывается сайтом сразу после регистрации — привязывает аккаунт к устройству.
+    Разрешаем только для первого (бесплатного) аккаунта на этом device_id/IP — все
+    последующие обязаны идти через consume_extra_account_request с оплаченным кодом."""
+    existing = await count_device_accounts(device_id, ip_address)
+    if existing > 0:
+        return False, "extra_account_requires_paid_code"
+
     url = SUPABASE_URL + "/rest/v1/device_accounts"
     async with httpx.AsyncClient() as client:
         r = await client.post(url, headers=_headers(), json={
-            "device_id": device_id, "user_id": user_id, "email": email
+            "device_id": device_id, "user_id": user_id, "email": email, "ip_address": ip_address
         })
-        return r.status_code in (200, 201)
+        return (r.status_code in (200, 201)), None
 
 
 async def find_pending_request(device_id: str):
@@ -203,3 +215,30 @@ async def consume_extra_account_request(code: str, device_id: str, new_user_id: 
             json={"device_id": device_id, "user_id": new_user_id, "email": email}
         )
     return True
+
+
+async def get_user_id_from_token(access_token: str):
+    """Проверяет access_token у самого Supabase Auth и возвращает id владельца токена.
+    Так бэкенд узнаёт, ЧЕЙ это токен, а не доверяет user_id, присланному клиентом напрямую."""
+    if not access_token:
+        return None
+    url = SUPABASE_URL + "/auth/v1/user"
+    headers = {
+        "Authorization": "Bearer " + access_token,
+        "apikey": SUPABASE_ANON_KEY,
+    }
+    async with httpx.AsyncClient() as client:
+        r = await client.get(url, headers=headers)
+        if r.status_code != 200:
+            return None
+        return r.json().get("id")
+
+
+async def delete_auth_user(user_id: str):
+    """По-настоящему удаляет пользователя из auth.users (через service-role Admin API).
+    Это единственный способ удалить учётку целиком — обычный клиентский ключ так не умеет.
+    Заодно срабатывает SQL-триггер, который чистит связанную запись в device_accounts."""
+    url = SUPABASE_URL + "/auth/v1/admin/users/" + user_id
+    async with httpx.AsyncClient() as client:
+        r = await client.delete(url, headers=_headers())
+        return r.status_code in (200, 204)
