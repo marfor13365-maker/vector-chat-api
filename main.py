@@ -15,7 +15,7 @@ from unlock_utils import (
     mark_request_paid,
     redeem_code,
     consume_extra_account_request,
-    find_user_id_by_email,
+    link_device_account,
 )
 
 app = FastAPI()
@@ -89,7 +89,7 @@ class SendPushRequest(BaseModel):
 class CreateUnlockRequest(BaseModel):
     type: str  # "unlock" или "extra_account"
     device_id: str
-    email: Optional[str] = None  # обязательно для type="unlock"
+    # email больше не нужен — для unlock аккаунт ищем по device_id
 
 class MarkPaidRequest(BaseModel):
     request_id: str
@@ -102,6 +102,10 @@ class ConsumeExtraRequest(BaseModel):
     code: str
     device_id: str
     new_user_id: str
+
+class LinkDeviceRequest(BaseModel):
+    device_id: str
+    user_id: str
 
 @app.get("/")
 def root():
@@ -289,28 +293,35 @@ async def api_send_push(req: SendPushRequest, x_api_key: str = Header(None)):
     result = await send_push_to_user(req.to_user_id, payload)
     return result
 
+# ── Привязка аккаунта к устройству (вызывается сайтом сразу после регистрации) ──
+
+@app.post("/api/device/link-account")
+async def api_link_device_account(req: LinkDeviceRequest):
+    ok = await link_device_account(req.device_id, req.user_id)
+    if not ok:
+        raise HTTPException(status_code=400, detail="link_failed")
+    return {"ok": True}
+
 # ── Разблокировка аккаунта / доп. аккаунт через промокод из Telegram-бота ──
 
 @app.post("/api/unlock/create-request")
 async def api_create_unlock_request(req: CreateUnlockRequest):
-    target_user_id = None
-    if req.type == "unlock":
-        if not req.email:
-            raise HTTPException(status_code=400, detail="email required for unlock")
-        target_user_id = await find_user_id_by_email(req.email)
-        if not target_user_id:
-            raise HTTPException(status_code=404, detail="user_not_found")
-    elif req.type != "extra_account":
+    if req.type not in ("unlock", "extra_account"):
         raise HTTPException(status_code=400, detail="invalid type")
 
-    request_id, deep_link, price = await create_unlock_request(req.type, req.device_id, target_user_id)
+    try:
+        request_id, deep_link, price = await create_unlock_request(req.type, req.device_id)
+    except ValueError as e:
+        # "no_account_for_device" — на этом устройстве ещё не было зарегистрировано ни одного аккаунта
+        raise HTTPException(status_code=404, detail=str(e))
+
     return {"request_id": request_id, "telegram_link": deep_link, "price": price}
 
 
 @app.get("/api/unlock/request/{request_id}")
 async def api_unlock_request_info(request_id: str):
     """Публичная (безопасная) информация о заявке — для бота, чтобы узнать тип/цену.
-    Не отдаёт email/target_user_id."""
+    Не отдаёт target_user_id."""
     req = await get_unlock_request(request_id)
     if not req:
         raise HTTPException(status_code=404, detail="not_found")
