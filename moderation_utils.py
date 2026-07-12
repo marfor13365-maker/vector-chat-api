@@ -1,13 +1,20 @@
 # moderation_utils.py
 # Положи рядом с main.py в репозитории vector-chat-api.
 #
-# Проверяет фото/видео-превью через Groq vision-модель перед публикацией в Blizko.
+# Проверяет фото/видео через Groq vision-модель — но ТОЛЬКО контент, который публикуется
+# в ленту (posts). Приватные фото в галерее профиля (не идущие в ленту) не модерируются.
+#
 # ВАЖНО: название vision-модели у Groq может со временем меняться — если получишь
 # ошибку "model not found", зайди в console.groq.com/docs/models и подставь
 # актуальное имя действующей vision-модели в переменную GROQ_VISION_MODEL на Render.
 
 import os
 import json
+import base64
+import tempfile
+import subprocess
+import httpx
+import imageio_ffmpeg
 from groq import Groq
 
 GROQ_API_KEY = os.environ.get("GROQ_KEY", "")
@@ -26,33 +33,74 @@ MODERATION_PROMPT = (
 )
 
 
+def _ask_groq_vision(image_content):
+    """image_content — либо публичный URL (строка), либо data URI (base64)."""
+    response = _client.chat.completions.create(
+        model=GROQ_VISION_MODEL,
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": MODERATION_PROMPT},
+                    {"type": "image_url", "image_url": {"url": image_content}}
+                ]
+            }
+        ],
+        max_tokens=150,
+        temperature=0
+    )
+    raw = response.choices[0].message.content.strip()
+    raw = raw.replace("```json", "").replace("```", "").strip()
+    data = json.loads(raw)
+    return bool(data.get("safe", True)), data.get("reason", "")
+
+
 async def moderate_image(image_url: str):
     """Возвращает (is_safe: bool, reason: str). При ошибке связи с Groq — пропускает
     контент (safe=True), чтобы сбой модерации не блокировал обычных пользователей;
     ошибка логируется на стороне вызывающего кода."""
     if not _client:
         return True, "moderation_disabled_no_api_key"
-
     try:
-        response = _client.chat.completions.create(
-            model=GROQ_VISION_MODEL,
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": MODERATION_PROMPT},
-                        {"type": "image_url", "image_url": {"url": image_url}}
-                    ]
-                }
-            ],
-            max_tokens=150,
-            temperature=0
-        )
-        raw = response.choices[0].message.content.strip()
-        # Модель иногда оборачивает JSON в ```json ... ``` — на всякий случай чистим
-        raw = raw.replace("```json", "").replace("```", "").strip()
-        data = json.loads(raw)
-        return bool(data.get("safe", True)), data.get("reason", "")
+        return _ask_groq_vision(image_url)
     except Exception as e:
         print("moderate_image error (пропускаем контент, не блокируем пользователя):", e)
+        return True, "moderation_error"
+
+
+async def moderate_video(video_url: str):
+    """Скачивает видео, вытаскивает один кадр (~1 секунда) через ffmpeg и проверяет его.
+    Это упрощённая проверка (один кадр, не весь ролик) — компромисс между точностью и
+    стоимостью/скоростью. При любой ошибке — пропускает контент, не блокируя пользователя."""
+    if not _client:
+        return True, "moderation_disabled_no_api_key"
+
+    try:
+        async with httpx.AsyncClient() as client:
+            r = await client.get(video_url, timeout=30.0)
+            if r.status_code != 200:
+                return True, "moderation_error_download"
+            video_bytes = r.content
+
+        with tempfile.NamedTemporaryFile(suffix=".mp4") as vid_f, \
+             tempfile.NamedTemporaryFile(suffix=".jpg") as frame_f:
+            vid_f.write(video_bytes)
+            vid_f.flush()
+
+            ffmpeg_bin = imageio_ffmpeg.get_ffmpeg_exe()
+            subprocess.run(
+                [ffmpeg_bin, "-y", "-i", vid_f.name, "-ss", "00:00:01.000",
+                 "-vframes", "1", frame_f.name],
+                check=True, capture_output=True, timeout=25
+            )
+            frame_f.seek(0)
+            frame_bytes = frame_f.read()
+
+        if not frame_bytes:
+            return True, "moderation_error_no_frame"
+
+        data_uri = "data:image/jpeg;base64," + base64.b64encode(frame_bytes).decode()
+        return _ask_groq_vision(data_uri)
+    except Exception as e:
+        print("moderate_video error (пропускаем контент, не блокируем пользователя):", e)
         return True, "moderation_error"
