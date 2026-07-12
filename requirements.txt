@@ -5,3 +5,6 @@ python-multipart
 aiofiles
 httpx
 pywebpush
+slowapi
+imageio-ffmpeg
+groq
