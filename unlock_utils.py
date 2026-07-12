@@ -217,6 +217,25 @@ async def consume_extra_account_request(code: str, device_id: str, new_user_id: 
     return True
 
 
+async def supabase_insert(table: str, payload: dict):
+    """Универсальная вставка записи через service-role (в обход RLS)."""
+    url = SUPABASE_URL + "/rest/v1/" + table
+    async with httpx.AsyncClient() as client:
+        r = await client.post(url, headers=_headers(), json=payload)
+        if r.status_code not in (200, 201):
+            raise Exception("Supabase insert error (" + table + "): " + r.text)
+        return r.json()[0]
+
+
+async def count_profile_photos(user_id: str) -> int:
+    url = SUPABASE_URL + "/rest/v1/profile_photos?user_id=eq." + user_id + "&select=id"
+    async with httpx.AsyncClient() as client:
+        r = await client.get(url, headers=_headers())
+        if r.status_code != 200:
+            return 0
+        return len(r.json())
+
+
 async def get_user_id_from_token(access_token: str):
     """Проверяет access_token у самого Supabase Auth и возвращает id владельца токена.
     Так бэкенд узнаёт, ЧЕЙ это токен, а не доверяет user_id, присланному клиентом напрямую."""
