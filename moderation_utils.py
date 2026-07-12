@@ -18,7 +18,7 @@ import imageio_ffmpeg
 from groq import Groq
 
 GROQ_API_KEY = os.environ.get("GROQ_KEY", "")
-GROQ_VISION_MODEL = os.environ.get("GROQ_VISION_MODEL", "llama-3.2-11b-vision-preview")
+GROQ_VISION_MODEL = os.environ.get("GROQ_VISION_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct")
 
 _client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
