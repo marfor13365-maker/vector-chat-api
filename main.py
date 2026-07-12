@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException, Query, Header
+from fastapi import FastAPI, UploadFile, File, HTTPException, Query, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional
@@ -7,9 +7,15 @@ import os
 import uuid
 import base64
 import httpx
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
 
 from push_utils import send_push_to_user
+from moderation_utils import moderate_image, moderate_video
 from unlock_utils import (
+    supabase_insert,
+    count_profile_photos,
     create_extra_account_request,
     get_unlock_request,
     mark_request_paid,
@@ -17,9 +23,15 @@ from unlock_utils import (
     consume_extra_account_request,
     link_device_account,
     list_device_accounts,
+    get_user_id_from_token,
+    delete_auth_user,
 )
 
 app = FastAPI()
+
+limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 app.add_middleware(
     CORSMiddleware,
@@ -107,6 +119,19 @@ class LinkDeviceRequest(BaseModel):
     device_id: str
     user_id: str
     email: str
+
+class DeleteAccountRequest(BaseModel):
+    user_id: str
+    access_token: str
+
+class CreatePostRequest(BaseModel):
+    user_id: str
+    access_token: str
+    photo_url: str
+    media_type: str = "photo"  # "photo" или "video"
+    caption: str = ""
+    also_feed: bool = False
+    profile_photo_id: Optional[str] = None  # если публикуем уже существующее фото в ленту
 
 @app.get("/")
 def root():
@@ -271,10 +296,12 @@ async def api_send_push(req: SendPushRequest, x_api_key: str = Header(None)):
 # ── Привязка аккаунта к устройству (сайт вызывает сразу после регистрации) ──
 
 @app.post("/api/device/link-account")
-async def api_link_device_account(req: LinkDeviceRequest):
-    ok = await link_device_account(req.device_id, req.user_id, req.email)
+@limiter.limit("10/minute")
+async def api_link_device_account(req: LinkDeviceRequest, request: Request):
+    client_ip = request.client.host if request.client else None
+    ok, error = await link_device_account(req.device_id, req.user_id, req.email, client_ip)
     if not ok:
-        raise HTTPException(status_code=400, detail="link_failed")
+        raise HTTPException(status_code=400, detail=error or "link_failed")
     return {"ok": True}
 
 @app.get("/api/device/accounts/{device_id}")
@@ -283,10 +310,26 @@ async def api_device_accounts(device_id: str):
     emails = await list_device_accounts(device_id)
     return {"emails": emails}
 
+@app.post("/api/account/delete")
+@limiter.limit("5/minute")
+async def api_delete_account(req: DeleteAccountRequest, request: Request):
+    """По-настоящему удаляет аккаунт из auth.users (обычный клиентский ключ так не умеет).
+    Сначала проверяем, что access_token реально принадлежит этому user_id — иначе
+    кто угодно мог бы удалить чужой аккаунт, просто зная его id."""
+    verified_id = await get_user_id_from_token(req.access_token)
+    if not verified_id or verified_id != req.user_id:
+        raise HTTPException(status_code=403, detail="token_mismatch")
+
+    ok = await delete_auth_user(req.user_id)
+    if not ok:
+        raise HTTPException(status_code=400, detail="delete_failed")
+    return {"ok": True}
+
 # ── Доп.аккаунт через код из резюме-бота (оплата за "забыл пароль" убрана полностью) ──
 
 @app.post("/api/unlock/create-request")
-async def api_create_extra_request(req: CreateExtraAccountRequest):
+@limiter.limit("5/minute")
+async def api_create_extra_request(req: CreateExtraAccountRequest, request: Request):
     request_id, link, price = await create_extra_account_request(req.device_id)
     return {"request_id": request_id, "telegram_link": link, "price": price}
 
@@ -315,11 +358,61 @@ async def api_mark_paid(req: MarkPaidRequest, x_api_key: str = Header(None)):
 
 
 @app.post("/api/unlock/redeem")
-async def api_redeem_code(req: RedeemCodeRequest):
+@limiter.limit("10/minute")
+async def api_redeem_code(req: RedeemCodeRequest, request: Request):
     result = await redeem_code(req.code, req.device_id)
     if not result.get("ok"):
         raise HTTPException(status_code=400, detail=result.get("error", "unknown_error"))
     return result
+
+
+@app.post("/api/posts/create")
+@limiter.limit("20/minute")
+async def api_create_post(req: CreatePostRequest, request: Request):
+    verified_id = await get_user_id_from_token(req.access_token)
+    if not verified_id or verified_id != req.user_id:
+        raise HTTPException(status_code=403, detail="token_mismatch")
+
+    # Модерация только для того, что реально попадёт в ленту (posts) —
+    # приватные фото/видео в галерее профиля (не идущие в ленту) не проверяются.
+    going_to_feed = bool(req.also_feed) or bool(req.profile_photo_id)
+    if going_to_feed:
+        if req.media_type == "video":
+            is_safe, reason = await moderate_video(req.photo_url)
+        else:
+            is_safe, reason = await moderate_image(req.photo_url)
+        if not is_safe:
+            raise HTTPException(status_code=400, detail="content_rejected: " + reason)
+
+    if req.profile_photo_id:
+        # публикация уже существующего фото профиля в ленту
+        row = await supabase_insert("posts", {
+            "user_id": req.user_id,
+            "photo_url": req.photo_url,
+            "caption": req.caption,
+            "media_type": req.media_type,
+            "profile_photo_id": req.profile_photo_id
+        })
+        return {"ok": True, "post": row}
+
+    existing_count = await count_profile_photos(req.user_id)
+    photo_row = await supabase_insert("profile_photos", {
+        "user_id": req.user_id,
+        "photo_url": req.photo_url,
+        "media_type": req.media_type,
+        "position": existing_count
+    })
+
+    if req.also_feed:
+        await supabase_insert("posts", {
+            "user_id": req.user_id,
+            "photo_url": req.photo_url,
+            "caption": req.caption,
+            "media_type": req.media_type,
+            "profile_photo_id": photo_row["id"]
+        })
+
+    return {"ok": True, "profile_photo": photo_row}
 
 
 @app.post("/api/unlock/consume-extra")
