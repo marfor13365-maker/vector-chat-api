@@ -133,6 +133,14 @@ class CreatePostRequest(BaseModel):
     also_feed: bool = False
     profile_photo_id: Optional[str] = None  # если публикуем уже существующее фото в ленту
 
+class CallNotifyRequest(BaseModel):
+    to_user_id: str
+    from_user_id: str
+    access_token: str
+    caller_name: str = "Пользователь"
+    call_id: str
+    match_id: str
+
 @app.get("/")
 def root():
     return {"status": "ok"}
@@ -421,3 +429,36 @@ async def api_consume_extra(req: ConsumeExtraRequest):
     if not ok:
         raise HTTPException(status_code=400, detail="invalid_or_used_code")
     return {"ok": True}
+
+
+# ── Push-уведомление о входящем звонке (сайт вызывает при старте звонка) ──
+
+@app.post("/api/calls/notify")
+@limiter.limit("20/minute")
+async def api_calls_notify(req: CallNotifyRequest, request: Request):
+    """Отправляет push 'входящий звонок'. Проверяем access_token, чтобы нельзя было
+    отправить звонок от чужого имени, просто зная user_id."""
+    verified_id = await get_user_id_from_token(req.access_token)
+    if not verified_id or verified_id != req.from_user_id:
+        raise HTTPException(status_code=403, detail="token_mismatch")
+
+    # Проверяем, не отключил ли получатель уведомления о звонках
+    async with httpx.AsyncClient() as client:
+        prof_r = await client.get(
+            SUPABASE_URL + "/rest/v1/profiles?id=eq." + req.to_user_id + "&select=notif_calls",
+            headers={"apikey": SUPABASE_KEY, "Authorization": "Bearer " + SUPABASE_KEY}
+        )
+        if prof_r.status_code == 200 and prof_r.json():
+            if prof_r.json()[0].get("notif_calls") is False:
+                return {"sent": 0, "reason": "notifications_disabled_by_user"}
+
+    payload = {
+        "title": "Входящий звонок",
+        "body": req.caller_name + " звонит вам",
+        "type": "call",
+        "callId": req.call_id,
+        "fromUserId": req.from_user_id,
+        "url": "/matches.html?incoming_call=" + req.call_id + "&match=" + req.match_id
+    }
+    result = await send_push_to_user(req.to_user_id, payload)
+    return result
