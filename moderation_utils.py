@@ -52,7 +52,18 @@ MODERATION_PROMPT = (
 
 
 def _ask_groq_vision(image_content):
-    """image_content — либо публичный URL (строка), либо data URI (base64)."""
+    """image_content — либо публичный URL (строка), либо data URI (base64).
+
+    ФИКС: qwen/qwen3.6-27b — reasoning-модель с режимом "размышления" (thinking mode),
+    включённым по умолчанию. Без reasoning_effort="none" модель сначала генерирует
+    внутренние рассуждения и только потом финальный ответ — а max_tokens=150 целиком
+    уходил на эти рассуждения, не оставляя токенов на сам JSON-ответ. Из-за этого
+    response.choices[0].message.content приходил ПУСТЫМ, json.loads() падал с ошибкой
+    "Expecting value: line 1 column 1 (char 0)", а код по правилу fail-open пропускал
+    контент как безопасный — модерация тихо переставала работать без единой видимой
+    ошибки в приложении. reasoning_effort="none" переводит модель в режим без
+    "размышлений" — для простой классификации (safe/unsafe) он не нужен, и вся
+    задача решается быстрее и укладывается в лимит токенов."""
     response = _client.chat.completions.create(
         model=GROQ_VISION_MODEL,
         messages=[
@@ -64,8 +75,9 @@ def _ask_groq_vision(image_content):
                 ]
             }
         ],
-        max_tokens=150,
-        temperature=0
+        max_tokens=400,
+        temperature=0,
+        reasoning_effort="none"
     )
     raw = response.choices[0].message.content.strip()
     raw = raw.replace("```json", "").replace("```", "").strip()
