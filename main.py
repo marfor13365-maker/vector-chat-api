@@ -141,6 +141,10 @@ class CallNotifyRequest(BaseModel):
     call_id: str
     match_id: str
 
+class ModerateRequest(BaseModel):
+    photo_url: str
+    media_type: str = "photo"  # "photo" или "video"
+
 @app.get("/")
 def root():
     return {"status": "ok"}
@@ -423,12 +427,20 @@ async def api_create_post(req: CreatePostRequest, request: Request):
     return {"ok": True, "profile_photo": photo_row}
 
 
-@app.post("/api/unlock/consume-extra")
-async def api_consume_extra(req: ConsumeExtraRequest):
-    ok = await consume_extra_account_request(req.code, req.device_id, req.new_user_id, req.email)
-    if not ok:
-        raise HTTPException(status_code=400, detail="invalid_or_used_code")
-    return {"ok": True}
+@app.post("/api/moderate")
+@limiter.limit("30/minute")
+async def api_moderate(req: ModerateRequest, request: Request):
+    """Лёгкий эндпоинт ТОЛЬКО для проверки контента — без побочных эффектов (ничего
+    никуда не пишет). Добавлен отдельно от /api/posts/create, потому что фронтенд
+    сейчас публикует посты напрямую через Supabase-клиент (в обход /api/posts/create),
+    из-за чего модерация фактически не вызывалась ни разу. Фронтенд должен звать этот
+    эндпоинт непосредственно перед тем, как что-либо публикуется в ленту (posts), и
+    отменять публикацию, если safe=false."""
+    if req.media_type == "video":
+        is_safe, reason = await moderate_video(req.photo_url)
+    else:
+        is_safe, reason = await moderate_image(req.photo_url)
+    return {"safe": is_safe, "reason": reason}
 
 
 # ── Push-уведомление о входящем звонке (сайт вызывает при старте звонка) ──
