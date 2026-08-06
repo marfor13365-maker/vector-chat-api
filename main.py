@@ -45,6 +45,8 @@ GROQ_KEY = os.environ.get("GROQ_KEY")
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 INTERNAL_API_KEY = os.environ.get("INTERNAL_API_KEY", "")
+TURN_KEY_ID = os.environ.get("TURN_KEY_ID", "")
+TURN_KEY_API_TOKEN = os.environ.get("TURN_KEY_API_TOKEN", "")
 
 def get_conn():
     return psycopg2.connect(DB)
@@ -444,6 +446,30 @@ async def api_moderate(req: ModerateRequest, request: Request):
 
 
 # ── Push-уведомление о входящем звонке (сайт вызывает при старте звонка) ──
+
+@app.get("/api/calls/turn-credentials")
+@limiter.limit("30/minute")
+async def api_turn_credentials(request: Request):
+    """Выдаёт временные TURN-креды от Cloudflare Realtime перед каждым звонком —
+    вместо статичных данных, вшитых в код фронтенда (которые мог бы скопировать
+    и использовать кто угодно). TURN_KEY_ID/TURN_KEY_API_TOKEN хранятся только на
+    сервере и никогда не попадают в браузер — фронтенд получает уже сгенерированный,
+    ограниченный по времени (ttl) список iceServers."""
+    if not TURN_KEY_ID or not TURN_KEY_API_TOKEN:
+        raise HTTPException(status_code=503, detail="turn_not_configured")
+    try:
+        async with httpx.AsyncClient() as client:
+            r = await client.post(
+                f"https://rtc.live.cloudflare.com/v1/turn/keys/{TURN_KEY_ID}/credentials/generate-ice-servers",
+                headers={"Authorization": f"Bearer {TURN_KEY_API_TOKEN}", "Content-Type": "application/json"},
+                json={"ttl": 3600},
+                timeout=10.0
+            )
+            r.raise_for_status()
+            return r.json()
+    except Exception as e:
+        raise HTTPException(status_code=502, detail="turn_fetch_failed: " + str(e))
+
 
 @app.post("/api/calls/notify")
 @limiter.limit("20/minute")
