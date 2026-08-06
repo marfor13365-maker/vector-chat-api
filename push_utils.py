@@ -14,7 +14,18 @@ from pywebpush import webpush, WebPushException
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
 SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
 VAPID_PRIVATE_KEY = os.environ.get("VAPID_PRIVATE_KEY", "")
-VAPID_CLAIM_EMAIL = os.environ.get("VAPID_CLAIM_EMAIL", "mailto:admin@example.com")
+
+# ФИКС: os.environ.get("VAPID_CLAIM_EMAIL", "mailto:admin@example.com") подставляет
+# дефолт ТОЛЬКО если переменной вообще нет на Render. Если она заведена, но оставлена
+# пустой (""), get() вернёт именно "" — дефолт в этом случае не срабатывает. Именно
+# поэтому pywebpush падал с "Missing 'sub' from claims": в vapid_claims уходила пустая
+# строка. Через `or` дефолт подставляется и в случае пустого значения, а не только
+# при полном отсутствии переменной.
+VAPID_CLAIM_EMAIL = os.environ.get("VAPID_CLAIM_EMAIL") or "mailto:admin@example.com"
+# Ещё одна частая ошибка настройки — вписать голый email без префикса mailto:.
+# pywebpush требует, чтобы sub был именно mailto: или https:// ссылкой.
+if not (VAPID_CLAIM_EMAIL.startswith("mailto:") or VAPID_CLAIM_EMAIL.startswith("https://")):
+    VAPID_CLAIM_EMAIL = "mailto:" + VAPID_CLAIM_EMAIL
 
 
 def _supabase_headers():
@@ -56,6 +67,10 @@ async def send_push_to_user(user_id: str, payload: dict):
       "url": "/call.html?call=abc123"
     }
     """
+    if not VAPID_PRIVATE_KEY:
+        print("send_push_to_user: VAPID_PRIVATE_KEY не задан, push отключён")
+        return {"sent": 0, "reason": "vapid_not_configured"}
+
     subs = await get_subscriptions_for_user(user_id)
     if not subs:
         return {"sent": 0, "reason": "no_subscriptions"}
